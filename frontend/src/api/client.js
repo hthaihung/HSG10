@@ -1,5 +1,5 @@
 // ----------------------------------------------
-// API Client � uses Vite env base URL
+// API Client - uses Vite env base URL
 // Default fallback keeps local dev working
 // ----------------------------------------------
 
@@ -12,15 +12,15 @@ function buildUrl(path) {
 async function fetchJSON(path) {
   const url = buildUrl(path);
   try {
-    console.log(`[API] ? ${url}`);
+    console.log(`[API] ➡️ ${url}`);
     const res = await fetch(url);
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      console.error(`[API] ? ${url} � ${res.status}`, text);
+      console.error(`[API] ❌ ${url} - ${res.status}`, text);
       throw new Error(`API ${res.status}: ${text || res.statusText}`);
     }
     const data = await res.json();
-    console.log(`[API] ? ${url}`, data);
+    console.log(`[API] ✅ ${url}`, data);
     return data;
   } catch (err) {
     console.error(`[API] NETWORK ERROR on ${url}:`, err);
@@ -56,7 +56,7 @@ export async function getTopSchools(filters = {}, metric = 'prizes') {
 }
 
 export async function getSubjectAverage(monThi) {
-  if (!monThi || monThi.toLowerCase() === 'all' || monThi.toLowerCase() === 't?t c?') {
+  if (!monThi || monThi.toLowerCase() === 'all' || monThi.toLowerCase() === 'tất cả') {
     return { mon_thi: monThi, average: 0.0 };
   }
   return fetchJSON(`/api/subject-average?mon_thi=${encodeURIComponent(monThi)}`);
