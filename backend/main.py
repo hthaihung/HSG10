@@ -60,6 +60,7 @@ def sanitize_db_url_and_connect_args(url: str) -> tuple[str, dict[str, Any]]:
 
 DATABASE_URL = normalize_async_database_url(DATABASE_URL_RAW)
 DATABASE_URL, DB_CONNECT_ARGS = sanitize_db_url_and_connect_args(DATABASE_URL)
+DB_CONNECT_ARGS["statement_cache_size"] = 0
 
 
 class Base(DeclarativeBase):
