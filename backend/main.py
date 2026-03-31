@@ -4,9 +4,10 @@ import json
 import math
 import os
 from functools import wraps
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
@@ -16,11 +17,49 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 PRIZE_LEVELS = ["Nhất", "Nhì", "Ba", "Khuyến khích"]
 CACHE_TTL_SECONDS = 600
+CACHE_PREFIX = "hsg_cache:"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SQLITE_PATH = os.path.join(BASE_DIR, "data", "students.db")
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{SQLITE_PATH}")
+DEFAULT_DB = "postgresql+asyncpg://postgres:postgres@localhost:5432/hsg"
+DATABASE_URL_RAW = os.getenv("DATABASE_URL", DEFAULT_DB)
 REDIS_URL = os.getenv("REDIS_URL")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+
+def normalize_async_database_url(url: str) -> str:
+    """Force SQLAlchemy async URL format for Postgres + asyncpg."""
+    if url.startswith("postgresql+asyncpg://"):
+        return url
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+    return url
+
+
+def sanitize_db_url_and_connect_args(url: str) -> tuple[str, dict[str, Any]]:
+    """
+    Convert common Postgres SSL query args to asyncpg-compatible connect_args.
+    Supabase/Render URLs often use sslmode=require.
+    """
+    parsed = urlsplit(url)
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    keep_pairs: list[tuple[str, str]] = []
+    connect_args: dict[str, Any] = {}
+
+    for key, value in query_pairs:
+        lowered = key.lower()
+        if lowered == "sslmode" and value.lower() == "require":
+            connect_args["ssl"] = "require"
+            continue
+        keep_pairs.append((key, value))
+
+    cleaned_query = urlencode(keep_pairs)
+    cleaned_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, cleaned_query, parsed.fragment))
+    return cleaned_url, connect_args
+
+
+DATABASE_URL = normalize_async_database_url(DATABASE_URL_RAW)
+DATABASE_URL, DB_CONNECT_ARGS = sanitize_db_url_and_connect_args(DATABASE_URL)
 
 
 class Base(DeclarativeBase):
@@ -50,11 +89,12 @@ engine = create_async_engine(
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
+    connect_args=DB_CONNECT_ARGS,
 )
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 redis_client: Optional[Redis] = None
 
-app = FastAPI(title="HSG Insight", version="5.0")
+app = FastAPI(title="HSG Insight", version="6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -78,12 +118,12 @@ def fmt_score(value: float) -> str:
 
 def build_cache_key(prefix: str, request: Request) -> str:
     if not request.query_params:
-        return f"{prefix}:all"
+        return f"{CACHE_PREFIX}{prefix}:all"
     parts = [f"{k}_{v}" for k, v in sorted(request.query_params.items())]
-    return f"{prefix}:{':'.join(parts)}"
+    return f"{CACHE_PREFIX}{prefix}:{':'.join(parts)}"
 
 
-async def get_cached_or_compute(request: Request, prefix: str, compute: Callable[[], Any]) -> Any:
+async def get_cached_or_compute(request: Request, prefix: str, compute: Callable[[], Awaitable[Any]]) -> Any:
     global redis_client
     key = build_cache_key(prefix, request)
 
@@ -104,7 +144,7 @@ def cached(prefix: str):
     def decorator(handler):
         @wraps(handler)
         async def wrapper(*args, **kwargs):
-            request: Request = kwargs.get("request")
+            request: Optional[Request] = kwargs.get("request")
             if request is None:
                 for arg in args:
                     if isinstance(arg, Request):
@@ -142,8 +182,7 @@ async def fetch_filtered_rows(
     gioi_tinh: Optional[str],
     xep_giai: Optional[str],
 ):
-    query = select(Student)
-    query = apply_filters(query, mon_thi, truong, gioi_tinh, xep_giai)
+    query = apply_filters(select(Student), mon_thi, truong, gioi_tinh, xep_giai)
     result = await session.execute(query)
     return result.scalars().all()
 
@@ -204,7 +243,7 @@ def build_ticker_insights(rows: list[Student], mon_thi: Optional[str] = None) ->
         top_subject = max(subject_scores.items(), key=lambda item: sum(item[1]) / len(item[1]))
         buckets["subject"].append(f"Môn điểm TB cao nhất là {top_subject[0]}: {fmt_score(sum(top_subject[1]) / len(top_subject[1]))}.")
 
-    ordered = []
+    ordered: list[str] = []
     for idx in range(max(len(v) for v in buckets.values())):
         for key in ["score", "school", "subject"]:
             if idx < len(buckets[key]):
@@ -213,14 +252,24 @@ def build_ticker_insights(rows: list[Student], mon_thi: Optional[str] = None) ->
     return ordered[:9] if ordered else ["Chưa có dữ liệu phù hợp."]
 
 
+async def clear_cache_namespace() -> int:
+    """Delete only app cache keys, avoids wiping unrelated Redis data."""
+    global redis_client
+    if redis_client is None:
+        return 0
+
+    deleted = 0
+    async for key in redis_client.scan_iter(match=f"{CACHE_PREFIX}*"):
+        deleted += await redis_client.delete(key)
+    return deleted
+
+
 @app.on_event("startup")
 async def startup_event():
     global redis_client
 
-    if not os.path.exists(SQLITE_PATH):
-        raise RuntimeError(
-            f"SQLite database not found at {SQLITE_PATH}. Run `python backend/scripts/migrate.py` first."
-        )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
     if REDIS_URL:
         try:
@@ -266,11 +315,9 @@ async def get_stats(
     xep_giai: Optional[str] = Query(None),
 ):
     async with SessionLocal() as session:
-        base = select(Student)
-        base = apply_filters(base, mon_thi, truong, gioi_tinh, xep_giai)
+        base = apply_filters(select(Student), mon_thi, truong, gioi_tinh, xep_giai)
 
-        total_query = select(func.count()).select_from(base.subquery())
-        total = int((await session.execute(total_query)).scalar_one())
+        total = int((await session.execute(select(func.count()).select_from(base.subquery()))).scalar_one())
 
         if total == 0:
             return {
@@ -281,12 +328,10 @@ async def get_stats(
                 "prize_breakdown": {level: 0 for level in PRIZE_LEVELS},
             }
 
-        avg_query = select(func.coalesce(func.avg(base.subquery().c.diem), 0.0))
-        avg_score = float((await session.execute(avg_query)).scalar_one())
+        avg_score = float((await session.execute(select(func.coalesce(func.avg(base.subquery().c.diem), 0.0)))).scalar_one())
 
         prize_case = case((Student.xep_giai.in_(PRIZE_LEVELS), 1), else_=0)
-        prize_total_query = select(func.sum(prize_case))
-        prize_total_query = apply_filters(prize_total_query, mon_thi, truong, gioi_tinh, xep_giai)
+        prize_total_query = apply_filters(select(func.sum(prize_case)), mon_thi, truong, gioi_tinh, xep_giai)
         total_prizes = int((await session.execute(prize_total_query)).scalar() or 0)
 
         prize_breakdown = {level: 0 for level in PRIZE_LEVELS}
@@ -296,8 +341,7 @@ async def get_stats(
             .group_by(Student.xep_giai)
         )
         breakdown_query = apply_filters(breakdown_query, mon_thi, truong, gioi_tinh, xep_giai)
-        breakdown_rows = await session.execute(breakdown_query)
-        for level, count in breakdown_rows.all():
+        for level, count in (await session.execute(breakdown_query)).all():
             prize_breakdown[str(level)] = int(count)
 
         pass_rate = round((total_prizes / total) * 100, 1)
@@ -338,10 +382,8 @@ async def get_score_distribution(
     xep_giai: Optional[str] = Query(None),
 ):
     async with SessionLocal() as session:
-        query = select(Student.diem)
-        query = apply_filters(query, mon_thi, truong, gioi_tinh, xep_giai)
-        result = await session.execute(query)
-        scores = [float(v or 0.0) for v in result.scalars().all()]
+        query = apply_filters(select(Student.diem), mon_thi, truong, gioi_tinh, xep_giai)
+        scores = [float(v or 0.0) for v in (await session.execute(query)).scalars().all()]
 
         if not scores:
             return {"bins": []}
@@ -380,7 +422,13 @@ async def get_top_schools(
             )
             query = apply_filters(query, mon_thi, truong, gioi_tinh, xep_giai)
             rows = (await session.execute(query)).all()
-            return {"schools": [{"school": str(name), "value": round(float(value or 0.0), 2)} for name, value in rows if name]}
+            return {
+                "schools": [
+                    {"school": str(name), "value": round(float(value or 0.0), 2)}
+                    for name, value in rows
+                    if name
+                ]
+            }
 
         query = (
             select(Student.truong, func.count().label("value"))
@@ -407,8 +455,7 @@ async def get_students(
     page_size: int = Query(20, ge=1, le=100),
 ):
     async with SessionLocal() as session:
-        query = select(Student)
-        query = apply_filters(query, mon_thi, truong, gioi_tinh, xep_giai)
+        query = apply_filters(select(Student), mon_thi, truong, gioi_tinh, xep_giai)
 
         if search and search.strip():
             value = search.strip().lower()
@@ -419,8 +466,7 @@ async def get_students(
                 )
             )
 
-        count_query = select(func.count()).select_from(query.subquery())
-        total = int((await session.execute(count_query)).scalar_one())
+        total = int((await session.execute(select(func.count()).select_from(query.subquery()))).scalar_one())
 
         if total == 0:
             return {
@@ -434,25 +480,22 @@ async def get_students(
 
         total_pages = math.ceil(total / page_size)
         offset = (page - 1) * page_size
+        students = (await session.execute(query.order_by(Student.diem.desc()).offset(offset).limit(page_size))).scalars().all()
 
-        paged_query = query.order_by(Student.diem.desc()).offset(offset).limit(page_size)
-        students = (await session.execute(paged_query)).scalars().all()
-
-        records = []
-        for row in students:
-            records.append(
-                {
-                    "sbd": row.sbd or "Không có",
-                    "ho_ten": row.ho_ten or "Không có",
-                    "truong": row.truong or "Không có",
-                    "mon_thi": row.mon_thi or "Không có",
-                    "diem": float(row.diem or 0.0),
-                    "xep_giai": row.xep_giai or "Không có",
-                    "percentile": float(row.percentile or 0.0),
-                    "rank": int(row.rank or 0),
-                    "total_in_subject": int(row.total_in_subject or 0),
-                }
-            )
+        records = [
+            {
+                "sbd": row.sbd or "Không có",
+                "ho_ten": row.ho_ten or "Không có",
+                "truong": row.truong or "Không có",
+                "mon_thi": row.mon_thi or "Không có",
+                "diem": float(row.diem or 0.0),
+                "xep_giai": row.xep_giai or "Không có",
+                "percentile": float(row.percentile or 0.0),
+                "rank": int(row.rank or 0),
+                "total_in_subject": int(row.total_in_subject or 0),
+            }
+            for row in students
+        ]
 
         return {
             "students": records,
@@ -487,8 +530,7 @@ async def export_csv(
     search: Optional[str] = Query(""),
 ):
     async with SessionLocal() as session:
-        query = select(Student)
-        query = apply_filters(query, mon_thi, truong, gioi_tinh, xep_giai)
+        query = apply_filters(select(Student), mon_thi, truong, gioi_tinh, xep_giai)
         if search and search.strip():
             value = search.strip().lower()
             query = query.where(
@@ -522,9 +564,21 @@ async def export_csv(
         )
 
 
+@app.post("/api/admin/clear-cache")
+async def clear_cache(
+    x_admin_key: Optional[str] = Header(default=None, alias="X-Admin-Key"),
+):
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="ADMIN_API_KEY is not configured")
+    if x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    deleted = await clear_cache_namespace()
+    return {"status": "ok", "deleted_keys": deleted}
+
+
 if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
-
