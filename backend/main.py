@@ -3,6 +3,7 @@ import io
 import json
 import math
 import os
+import asyncio
 from functools import wraps
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -61,6 +62,7 @@ def sanitize_db_url_and_connect_args(url: str) -> tuple[str, dict[str, Any]]:
 DATABASE_URL = normalize_async_database_url(DATABASE_URL_RAW)
 DATABASE_URL, DB_CONNECT_ARGS = sanitize_db_url_and_connect_args(DATABASE_URL)
 DB_CONNECT_ARGS["statement_cache_size"] = 0
+DB_CONNECT_ARGS["timeout"] = 60
 
 
 class Base(DeclarativeBase):
@@ -88,8 +90,8 @@ engine = create_async_engine(
     DATABASE_URL,
     future=True,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=3,
+    max_overflow=5,
     connect_args=DB_CONNECT_ARGS,
 )
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -269,8 +271,22 @@ async def clear_cache_namespace() -> int:
 async def startup_event():
     global redis_client
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    for attempt in range(1, 4):
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            break
+        except Exception as exc:
+            is_timeout = "TimeoutError" in exc.__class__.__name__
+            if is_timeout and attempt < 3:
+                print(f"[WARN] Database startup timeout (attempt {attempt}/3): {exc}")
+                await asyncio.sleep(5)
+                continue
+            if is_timeout:
+                print(f"[WARN] Database startup failed after 3 attempts: {exc}")
+                break
+            print(f"[WARN] Database startup error: {exc}")
+            break
 
     if REDIS_URL:
         try:
