@@ -164,9 +164,9 @@ redis_client: Optional[Redis] = None
 app = FastAPI(title="HSG Insight", version="6.0")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
-    return {"status": "ok", "message": "Backend is running"}
+    return {"status": "ok", "message": "Backend is running TH TH TH"}
 
 
 app.add_middleware(
