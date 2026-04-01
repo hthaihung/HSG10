@@ -61,11 +61,7 @@ def sanitize_db_url_and_connect_args(url: str) -> tuple[str, dict[str, Any]]:
 
 
 DATABASE_URL = normalize_async_database_url(DATABASE_URL_RAW)
-DATABASE_URL, DB_CONNECT_ARGS = sanitize_db_url_and_connect_args(DATABASE_URL)
-DB_CONNECT_ARGS["statement_cache_size"] = 0
-DB_CONNECT_ARGS["command_timeout"] = 8
-DB_CONNECT_ARGS["timeout"] = 8
-DB_CONNECT_ARGS["server_settings"] = {"application_name": "hsg_fastapi"}
+DATABASE_URL, _LEGACY_CONNECT_ARGS_UNUSED = sanitize_db_url_and_connect_args(DATABASE_URL)
 
 
 class Base(DeclarativeBase):
@@ -89,18 +85,80 @@ class Student(Base):
     total_in_subject: Mapped[int] = mapped_column(Integer, default=0)
 
 
+# --- Cấu hình connect_args cho asyncpg + PgBouncer Transaction Mode ---
+# statement_cache_size=0 là BẮT BUỘC. PgBouncer Transaction Mode không
+# hỗ trợ named prepared statements của PostgreSQL. Nếu thiếu dòng này,
+# sẽ xuất hiện lỗi "prepared statement does not exist" ngẫu nhiên.
+#
+# command_timeout=10: thời gian tối đa (giây) asyncpg chờ 1 query hoàn thành.
+# timeout=10: thời gian tối đa (giây) asyncpg chờ thiết lập kết nối mới.
+# Cả hai phải NHỎ HƠN pool_timeout (15s) để tránh collision timeout.
+_ASYNCPG_CONNECT_ARGS = {
+    "statement_cache_size": 0,
+    "command_timeout": 10,
+    "timeout": 10,
+    "server_settings": {
+        "application_name": "hsg_fastapi",
+    },
+}
+
+# --- Lý do chọn từng tham số của QueuePool ---
+#
+# pool_size=2:
+#   Số kết nối persistent tối đa mỗi instance Render duy trì.
+#   3 instances × 2 = 6 kết nối steady-state. An toàn dưới giới hạn 15
+#   của Supabase Free Tier, còn dư headroom cho max_overflow.
+#
+# max_overflow=1:
+#   Cho phép tạo thêm tối đa 1 kết nối tạm thời khi pool đầy (burst).
+#   3 instances × (2 + 1) = 9 kết nối tối đa tuyệt đối. Không bao giờ
+#   chạm giới hạn 15 của Supabase.
+#
+# pool_recycle=180:
+#   SQLAlchemy tự đóng và tạo lại kết nối sau 180 giây (3 phút).
+#   PgBouncer Free Tier giết kết nối idle sau ~5 phút. Đặt recycle
+#   ngắn hơn đảm bảo SQLAlchemy luôn chủ động drop trước, tránh race
+#   condition khi PgBouncer đột ngột đóng kết nối phía dưới.
+#
+# pool_timeout=15:
+#   Thời gian tối đa (giây) một request chờ lấy kết nối từ pool.
+#   Phải LỚN HƠN command_timeout (10s) và timeout (10s) của asyncpg.
+#   Nếu để nhỏ hơn, pool_timeout sẽ fire trước khi asyncpg có cơ hội
+#   tự xử lý, gây ra lỗi giả (false timeout error).
+#
+# pool_pre_ping=True:
+#   Gửi "SELECT 1" kiểm tra trước khi dùng kết nối từ pool. Không phải
+#   silver bullet (vẫn có race condition), nhưng loại bỏ được phần lớn
+#   stale connections. Giữ lại vì chi phí thấp.
+#
+# pool_use_lifo=True:
+#   Pool dùng theo thứ tự LIFO (Last-In-First-Out). Kết nối vừa dùng
+#   xong sẽ được tái sử dụng trước tiên. Điều này giữ số lượng kết nối
+#   "warm" ở mức tối thiểu, cho phép các kết nối idle cũ hơn đạt đến
+#   pool_recycle và bị drop sạch sẽ. Giảm đáng kể số lượng kết nối bị
+#   PgBouncer kill ngầm bên dưới.
 engine = create_async_engine(
-    DATABASE_URL,
-    future=True,
-    # SQLAlchemy async engine uses async-adapted queue pool by default.
+    os.environ["DATABASE_URL"],  
+    # DATABASE_URL phải có dạng:
+    # postgresql+asyncpg://user:pass@host:6543/db?prepared_statement_cache_size=0
     pool_size=2,
-    max_overflow=2,
-    pool_timeout=10,
-    pool_recycle=300,
+    max_overflow=1,
+    pool_recycle=180,
+    pool_timeout=15,
     pool_pre_ping=True,
-    connect_args=DB_CONNECT_ARGS,
+    pool_use_lifo=True,
+    connect_args=_ASYNCPG_CONNECT_ARGS,
+    echo=False,
 )
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autocommit=False,
+    autoflush=False,
+)
+SessionLocal = AsyncSessionLocal
 redis_client: Optional[Redis] = None
 
 app = FastAPI(title="HSG Insight", version="6.0")
