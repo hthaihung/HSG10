@@ -15,7 +15,7 @@ from redis.asyncio import Redis
 from sqlalchemy import Float, Integer, String, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import QueuePool
 
 PRIZE_LEVELS = ["Nhất", "Nhì", "Ba", "Khuyến khích"]
 CACHE_TTL_SECONDS = 600
@@ -64,7 +64,9 @@ def sanitize_db_url_and_connect_args(url: str) -> tuple[str, dict[str, Any]]:
 DATABASE_URL = normalize_async_database_url(DATABASE_URL_RAW)
 DATABASE_URL, DB_CONNECT_ARGS = sanitize_db_url_and_connect_args(DATABASE_URL)
 DB_CONNECT_ARGS["statement_cache_size"] = 0
-DB_CONNECT_ARGS["timeout"] = 60
+DB_CONNECT_ARGS["command_timeout"] = 8
+DB_CONNECT_ARGS["timeout"] = 8
+DB_CONNECT_ARGS["server_settings"] = {"application_name": "hsg_fastapi"}
 
 
 class Base(DeclarativeBase):
@@ -91,7 +93,12 @@ class Student(Base):
 engine = create_async_engine(
     DATABASE_URL,
     future=True,
-    poolclass=NullPool,
+    poolclass=QueuePool,
+    pool_size=2,
+    max_overflow=1,
+    pool_timeout=10,
+    pool_recycle=300,
+    pool_pre_ping=True,
     connect_args=DB_CONNECT_ARGS,
 )
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -112,6 +119,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def add_cache_control_header(request: Request, call_next):
+    response = await call_next(request)
+    if request.method == "GET" and request.url.path.startswith("/api/") and response.status_code == 200:
+        response.headers["Cache-Control"] = "public, max-age=1800, stale-while-revalidate=86400"
+    return response
 
 
 def is_all_value(value: Optional[str]) -> bool:
