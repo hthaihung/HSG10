@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 
 import Header from './components/layout/Header';
 import FilterBar from './components/layout/FilterBar';
@@ -12,7 +12,7 @@ import CenteredProfileModal from './components/modal/CenteredProfileModal';
 import { X } from 'lucide-react';
 
 import {
-  getFilters, getStats, getScoreDistribution, getTopSchools, getStudents
+  getFilters, getDashboard
 } from './api/client';
 
 export default function App() {
@@ -31,11 +31,11 @@ export default function App() {
   const [topSchoolsData,setTopSchoolsData] = useState(null);
   const [studentsData,  setStudentsData]  = useState(null);
 
-  const [dashLoading,     setDashLoading]     = useState(true);
+  const [dashLoading, setDashLoading] = useState(true);
   const [studentsLoading, setStudentsLoading] = useState(true);
-  const [apiError,        setApiError]        = useState(false);
-  const [page,            setPage]            = useState(1);
-  const [schoolMetric,    setSchoolMetric]    = useState('prizes');
+  const [apiError, setApiError] = useState(false);
+  const [page, setPage] = useState(1);
+  const [schoolMetric, setSchoolMetric] = useState('prizes');
 
   const [selectedStudent,   setSelectedStudent]   = useState(null);
   const [isTableFullscreen, setIsTableFullscreen] = useState(false);
@@ -59,41 +59,51 @@ export default function App() {
     getFilters().then(setFilterOptions).catch(console.error);
   }, []);
 
-  const fetchDashboard = useCallback(async () => {
-    setDashLoading(true);
-    setApiError(false);
-    try {
-      const [s, sd, ts] = await Promise.all([
-        getStats(filters),
-        getScoreDistribution(filters),
-        getTopSchools(filters, schoolMetric),
-      ]);
-      setStats(s);
-      setScoreDist(sd);
-      setTopSchoolsData(ts);
-    } catch (e) {
-      console.error('[App] dashboard fetch error:', e);
-      setApiError(true);
-    } finally {
-      setDashLoading(false);
-    }
-  }, [filters, schoolMetric]);
+  useEffect(() => {
+    const timer = setTimeout(async () => {
+      setDashLoading(true);
+      setStudentsLoading(true);
+      setApiError(false);
+      try {
+        const data = await getDashboard(filters, {
+          search: '',
+          page,
+          pageSize: 20,
+          metric: schoolMetric,
+        });
 
-  useEffect(() => { fetchDashboard(); }, [fetchDashboard]);
+        setStats(data?.stats || null);
+        setScoreDist(data?.chart || null);
+        setTopSchoolsData(
+          Array.isArray(data?.top_schools)
+            ? { schools: data.top_schools }
+            : (data?.top_schools || null),
+        );
 
-  const fetchStudents = useCallback(async () => {
-    setStudentsLoading(true);
-    try {
-      const data = await getStudents(filters, '', page);
-      setStudentsData(data);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setStudentsLoading(false);
-    }
-  }, [filters, page]);
+        if (Array.isArray(data?.students)) {
+          setStudentsData({
+            students: data.students,
+            total: data.students.length,
+            page,
+            page_size: 20,
+            total_pages: data.students.length > 0 ? 1 : 0,
+            current_page: page,
+          });
+        } else {
+          setStudentsData(data?.students || null);
+        }
+      } catch (e) {
+        console.error('[App] dashboard fetch error:', e);
+        setApiError(true);
+      } finally {
+        setDashLoading(false);
+        setStudentsLoading(false);
+      }
+    }, 300);
 
-  useEffect(() => { fetchStudents(); }, [fetchStudents]);
+    return () => clearTimeout(timer);
+  }, [filters, page, schoolMetric]);
+
   useEffect(() => { setPage(1); }, [filters]);
 
   const hasNoData = () => !dashLoading && stats && stats.total === 0;

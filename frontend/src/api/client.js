@@ -28,6 +28,22 @@ export async function getFilters() {
   return apiFetch("/api/filters");
 }
 
+export async function getDashboard(
+  filters = {},
+  { search = "", page = 1, pageSize = 20, metric = "prizes", limit = 10 } = {},
+) {
+  return apiFetch(
+    `/api/dashboard${qs({
+      ...filters,
+      search,
+      page,
+      page_size: pageSize,
+      metric,
+      limit,
+    })}`,
+  );
+}
+
 export async function getStats(filters = {}) {
   return apiFetch(`/api/stats${qs(filters)}`);
 }

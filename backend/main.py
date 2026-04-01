@@ -4,6 +4,7 @@ import json
 import math
 import os
 import logging
+import time
 from functools import wraps
 from typing import Any, Awaitable, Callable, Optional
 
@@ -22,6 +23,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 PRIZE_LEVELS = ["Nhất", "Nhì", "Ba", "Khuyến khích"]
 CACHE_TTL_SECONDS = 600
 CACHE_PREFIX = "hsg_cache:"
+LOCAL_STATS_TTL_SECONDS = 60
+LOCAL_LIST_TTL_SECONDS = 20
+LOCAL_CHART_TTL_SECONDS = 20
+LOCAL_TOP_SCHOOLS_TTL_SECONDS = 20
+
+_LOCAL_CACHE: dict[str, tuple[float, Any]] = {}
 
 _RAW_DB_URL = os.environ["DATABASE_URL"]
 
@@ -117,6 +124,31 @@ def fmt_score(value: float) -> str:
     return f"{float(value):.1f}"
 
 
+def _build_local_key(
+    mon_thi: Optional[str],
+    truong: Optional[str],
+    gioi_tinh: Optional[str],
+    xep_giai: Optional[str],
+    search: str = "",
+) -> str:
+    return f"{mon_thi}:{truong}:{gioi_tinh}:{xep_giai}:{search}"
+
+
+def _get_local_cache(cache_key: str) -> Any:
+    payload = _LOCAL_CACHE.get(cache_key)
+    if not payload:
+        return None
+    expires_at, value = payload
+    if expires_at <= time.time():
+        _LOCAL_CACHE.pop(cache_key, None)
+        return None
+    return value
+
+
+def _set_local_cache(cache_key: str, value: Any, ttl_seconds: int) -> None:
+    _LOCAL_CACHE[cache_key] = (time.time() + ttl_seconds, value)
+
+
 def build_cache_key(prefix: str, request: Request) -> str:
     if not request.query_params:
         return f"{CACHE_PREFIX}{prefix}:all"
@@ -186,6 +218,39 @@ async def fetch_filtered_rows(
     query = apply_filters(select(Student), mon_thi, truong, gioi_tinh, xep_giai)
     result = await session.execute(query)
     return result.scalars().all()
+
+
+async def fetch_score_bins(
+    session: AsyncSession,
+    mon_thi: Optional[str],
+    truong: Optional[str],
+    gioi_tinh: Optional[str],
+    xep_giai: Optional[str],
+) -> list[dict[str, int]]:
+    labels = ["<10", "10-12", "12-14", "14-16", "16-18", "18-20"]
+    counts = {label: 0 for label in labels}
+
+    bucket = case(
+        (Student.diem < 10, "<10"),
+        (Student.diem < 12, "10-12"),
+        (Student.diem < 14, "12-14"),
+        (Student.diem < 16, "14-16"),
+        (Student.diem < 18, "16-18"),
+        else_="18-20",
+    ).label("bucket")
+
+    bucket_query = apply_filters(
+        select(bucket, func.count(Student.id)).group_by(bucket),
+        mon_thi,
+        truong,
+        gioi_tinh,
+        xep_giai,
+    )
+    for label, count in (await session.execute(bucket_query)).all():
+        if label in counts:
+            counts[str(label)] = int(count)
+
+    return [{"range": label, "count": counts[label]} for label in labels]
 
 
 def build_ticker_insights(rows: list[Student], mon_thi: Optional[str] = None) -> list[str]:
@@ -313,25 +378,38 @@ async def get_stats(
     gioi_tinh: Optional[str] = Query(None),
     xep_giai: Optional[str] = Query(None),
 ):
+    stats_cache_key = f"stats:{_build_local_key(mon_thi, truong, gioi_tinh, xep_giai)}"
+    cached_stats = _get_local_cache(stats_cache_key)
+    if cached_stats is not None:
+        return cached_stats
+
     async with SessionLocal() as session:
-        total_query = apply_filters(select(func.count()), mon_thi, truong, gioi_tinh, xep_giai)
-        total = int((await session.execute(total_query)).scalar_one())
+        aggregate_query = apply_filters(
+            select(
+                func.count(Student.id),
+                func.coalesce(func.avg(Student.diem), 0.0),
+                func.coalesce(func.sum(case((Student.xep_giai.in_(PRIZE_LEVELS), 1), else_=0)), 0),
+            ),
+            mon_thi,
+            truong,
+            gioi_tinh,
+            xep_giai,
+        )
+        total, avg_score, total_prizes = (await session.execute(aggregate_query)).one()
+        total = int(total or 0)
+        avg_score = float(avg_score or 0.0)
+        total_prizes = int(total_prizes or 0)
 
         if total == 0:
-            return {
+            payload = {
                 "total": 0,
                 "avg_score": 0.0,
                 "total_prizes": 0,
                 "pass_rate": 0.0,
                 "prize_breakdown": {level: 0 for level in PRIZE_LEVELS},
             }
-
-        avg_query = apply_filters(select(func.coalesce(func.avg(Student.diem), 0.0)), mon_thi, truong, gioi_tinh, xep_giai)
-        avg_score = float((await session.execute(avg_query)).scalar_one())
-
-        prize_case = case((Student.xep_giai.in_(PRIZE_LEVELS), 1), else_=0)
-        prize_total_query = apply_filters(select(func.sum(prize_case)), mon_thi, truong, gioi_tinh, xep_giai)
-        total_prizes = int((await session.execute(prize_total_query)).scalar() or 0)
+            _set_local_cache(stats_cache_key, payload, LOCAL_STATS_TTL_SECONDS)
+            return payload
 
         prize_breakdown = {level: 0 for level in PRIZE_LEVELS}
         breakdown_query = (
@@ -343,15 +421,18 @@ async def get_stats(
         for level, count in (await session.execute(breakdown_query)).all():
             prize_breakdown[str(level)] = int(count)
 
-        pass_rate = round((total_prizes / total) * 100, 1)
+        raw_rate = (total_prizes / total) * 100 if total else 0.0
+        pass_rate = round(min(100.0, raw_rate), 1)
 
-        return {
+        payload = {
             "total": total,
             "avg_score": round(avg_score, 2),
             "total_prizes": total_prizes,
             "pass_rate": pass_rate,
             "prize_breakdown": prize_breakdown,
         }
+        _set_local_cache(stats_cache_key, payload, LOCAL_STATS_TTL_SECONDS)
+        return payload
 
 
 @app.get("/api/subject-average")
@@ -381,23 +462,8 @@ async def get_score_distribution(
     xep_giai: Optional[str] = Query(None),
 ):
     async with SessionLocal() as session:
-        query = apply_filters(select(Student.diem), mon_thi, truong, gioi_tinh, xep_giai)
-        scores = [float(v or 0.0) for v in (await session.execute(query)).scalars().all()]
-
-        if not scores:
-            return {"bins": []}
-
-        edges = [0, 10, 12, 14, 16, 18, 20.01]
-        labels = ["<10", "10-12", "12-14", "14-16", "16-18", "18-20"]
-        counts = {label: 0 for label in labels}
-
-        for score in scores:
-            for idx in range(len(labels)):
-                if edges[idx] <= score < edges[idx + 1]:
-                    counts[labels[idx]] += 1
-                    break
-
-        return {"bins": [{"range": label, "count": counts[label]} for label in labels]}
+        bins = await fetch_score_bins(session, mon_thi, truong, gioi_tinh, xep_giai)
+        return {"bins": bins}
 
 
 @app.get("/api/top-schools")
@@ -453,6 +519,11 @@ async def get_students(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
+    students_cache_key = f"students:{_build_local_key(mon_thi, truong, gioi_tinh, xep_giai, search or '')}:{page}:{page_size}"
+    cached_students = _get_local_cache(students_cache_key)
+    if cached_students is not None:
+        return cached_students
+
     async with SessionLocal() as session:
         query = apply_filters(select(Student), mon_thi, truong, gioi_tinh, xep_giai)
         count_query = apply_filters(select(func.count()), mon_thi, truong, gioi_tinh, xep_giai)
@@ -469,7 +540,7 @@ async def get_students(
         total = int((await session.execute(count_query)).scalar_one())
 
         if total == 0:
-            return {
+            payload = {
                 "students": [],
                 "total": 0,
                 "page": 1,
@@ -477,6 +548,8 @@ async def get_students(
                 "total_pages": 0,
                 "current_page": 1,
             }
+            _set_local_cache(students_cache_key, payload, LOCAL_LIST_TTL_SECONDS)
+            return payload
 
         total_pages = math.ceil(total / page_size)
         offset = (page - 1) * page_size
@@ -497,7 +570,7 @@ async def get_students(
             for row in students
         ]
 
-        return {
+        payload = {
             "students": records,
             "total": total,
             "page": page,
@@ -505,6 +578,8 @@ async def get_students(
             "total_pages": total_pages,
             "current_page": page,
         }
+        _set_local_cache(students_cache_key, payload, LOCAL_LIST_TTL_SECONDS)
+        return payload
 
 
 @app.get("/api/ticker-insights")
@@ -519,6 +594,143 @@ async def get_ticker_insights(
     async with SessionLocal() as session:
         rows = await fetch_filtered_rows(session, mon_thi, truong, gioi_tinh, xep_giai)
         return {"insights": build_ticker_insights(rows, mon_thi=mon_thi)}
+
+
+@app.get("/dashboard")
+@app.get("/api/dashboard")
+async def get_dashboard(
+    mon_thi: Optional[str] = Query(None),
+    truong: Optional[str] = Query(None),
+    gioi_tinh: Optional[str] = Query(None),
+    xep_giai: Optional[str] = Query(None),
+    search: Optional[str] = Query(""),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    metric: str = Query("prizes"),
+    limit: int = Query(10, ge=1, le=50),
+):
+    base_key = _build_local_key(mon_thi, truong, gioi_tinh, xep_giai, search or "")
+    stats_cache_key = f"dashboard:stats:{base_key}"
+    students_cache_key = f"dashboard:students:{base_key}:{page}:{page_size}"
+    chart_cache_key = f"dashboard:chart:{base_key}"
+    top_cache_key = f"dashboard:top:{base_key}:{metric}:{limit}"
+
+    async with SessionLocal() as session:
+        stats_payload = _get_local_cache(stats_cache_key)
+        if stats_payload is None:
+            aggregate_query = apply_filters(
+                select(
+                    func.count(Student.id),
+                    func.coalesce(func.avg(Student.diem), 0.0),
+                    func.coalesce(func.sum(case((Student.xep_giai.in_(PRIZE_LEVELS), 1), else_=0)), 0),
+                ),
+                mon_thi,
+                truong,
+                gioi_tinh,
+                xep_giai,
+            )
+            total, avg_score, total_prizes = (await session.execute(aggregate_query)).one()
+            total = int(total or 0)
+            avg_score = float(avg_score or 0.0)
+            total_prizes = int(total_prizes or 0)
+
+            prize_breakdown = {level: 0 for level in PRIZE_LEVELS}
+            if total > 0:
+                breakdown_query = (
+                    select(Student.xep_giai, func.count())
+                    .where(Student.xep_giai.in_(PRIZE_LEVELS))
+                    .group_by(Student.xep_giai)
+                )
+                breakdown_query = apply_filters(breakdown_query, mon_thi, truong, gioi_tinh, xep_giai)
+                for level, count in (await session.execute(breakdown_query)).all():
+                    prize_breakdown[str(level)] = int(count)
+
+            raw_rate = (total_prizes / total) * 100 if total else 0.0
+            stats_payload = {
+                "total": total,
+                "avg_score": round(avg_score, 2),
+                "total_prizes": total_prizes,
+                "pass_rate": round(min(100.0, raw_rate), 1),
+                "prize_breakdown": prize_breakdown,
+            }
+            _set_local_cache(stats_cache_key, stats_payload, LOCAL_STATS_TTL_SECONDS)
+
+        students_payload = _get_local_cache(students_cache_key)
+        if students_payload is None:
+            students_query = apply_filters(select(Student), mon_thi, truong, gioi_tinh, xep_giai)
+            if search and search.strip():
+                value = search.strip().lower()
+                students_query = students_query.where(
+                    or_(
+                        func.lower(Student.sbd).like(f"%{value}%"),
+                        func.lower(Student.ho_ten).like(f"%{value}%"),
+                    )
+                )
+
+            offset = (page - 1) * page_size
+            student_rows = (
+                await session.execute(
+                    students_query.order_by(Student.diem.desc()).offset(offset).limit(page_size)
+                )
+            ).scalars().all()
+            students_payload = [
+                {
+                    "sbd": row.sbd or "Không có",
+                    "ho_ten": row.ho_ten or "Không có",
+                    "truong": row.truong or "Không có",
+                    "mon_thi": row.mon_thi or "Không có",
+                    "diem": float(row.diem or 0.0),
+                    "xep_giai": row.xep_giai or "Không có",
+                    "percentile": float(row.percentile or 0.0),
+                    "rank": int(row.rank or 0),
+                    "total_in_subject": int(row.total_in_subject or 0),
+                }
+                for row in student_rows
+            ]
+            _set_local_cache(students_cache_key, students_payload, LOCAL_LIST_TTL_SECONDS)
+
+        chart_payload = _get_local_cache(chart_cache_key)
+        if chart_payload is None:
+            chart_payload = {"bins": await fetch_score_bins(session, mon_thi, truong, gioi_tinh, xep_giai)}
+            _set_local_cache(chart_cache_key, chart_payload, LOCAL_CHART_TTL_SECONDS)
+
+        top_schools_payload = _get_local_cache(top_cache_key)
+        if top_schools_payload is None:
+            if metric == "avg_score":
+                top_query = (
+                    select(Student.truong, func.avg(Student.diem).label("value"))
+                    .group_by(Student.truong)
+                    .order_by(func.avg(Student.diem).desc())
+                    .limit(limit)
+                )
+                top_query = apply_filters(top_query, mon_thi, truong, gioi_tinh, xep_giai)
+                rows = (await session.execute(top_query)).all()
+                schools = [
+                    {"school": str(name), "value": round(float(value or 0.0), 2)}
+                    for name, value in rows
+                    if name
+                ]
+            else:
+                top_query = (
+                    select(Student.truong, func.count().label("value"))
+                    .where(Student.xep_giai.in_(PRIZE_LEVELS))
+                    .group_by(Student.truong)
+                    .order_by(func.count().desc())
+                    .limit(limit)
+                )
+                top_query = apply_filters(top_query, mon_thi, truong, gioi_tinh, xep_giai)
+                rows = (await session.execute(top_query)).all()
+                schools = [{"school": str(name), "value": int(value)} for name, value in rows if name]
+
+            top_schools_payload = schools
+            _set_local_cache(top_cache_key, top_schools_payload, LOCAL_TOP_SCHOOLS_TTL_SECONDS)
+
+    return {
+        "stats": stats_payload,
+        "students": students_payload,
+        "chart": chart_payload,
+        "top_schools": top_schools_payload,
+    }
 
 
 @app.get("/api/export")
