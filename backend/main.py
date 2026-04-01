@@ -4,6 +4,7 @@ import json
 import math
 import os
 import asyncio
+import logging
 from functools import wraps
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -12,7 +13,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
-from sqlalchemy import Float, Integer, String, case, func, or_, select
+from sqlalchemy import Float, Integer, String, case, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -24,6 +25,7 @@ DEFAULT_DB = "postgresql+asyncpg://postgres:postgres@localhost:5432/hsg"
 DATABASE_URL_RAW = os.getenv("DATABASE_URL", DEFAULT_DB)
 REDIS_URL = os.getenv("REDIS_URL")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+logging.basicConfig(level=logging.INFO)
 
 
 def normalize_async_database_url(url: str) -> str:
@@ -98,6 +100,13 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 redis_client: Optional[Redis] = None
 
 app = FastAPI(title="HSG Insight", version="6.0")
+
+
+@app.get("/")
+async def health_check():
+    return {"status": "ok", "message": "Backend is running"}
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -274,19 +283,16 @@ async def startup_event():
     for attempt in range(1, 4):
         try:
             async with engine.begin() as conn:
+                await conn.execute(text("SELECT 1"))
                 await conn.run_sync(Base.metadata.create_all)
+            logging.info("Database connected successfully.")
             break
-        except Exception as exc:
-            is_timeout = "TimeoutError" in exc.__class__.__name__
-            if is_timeout and attempt < 3:
-                print(f"[WARN] Database startup timeout (attempt {attempt}/3): {exc}")
+        except Exception as e:
+            logging.warning(f"Database startup failed (attempt {attempt}/3). Error: {str(e)}")
+            if attempt < 3:
                 await asyncio.sleep(5)
-                continue
-            if is_timeout:
-                print(f"[WARN] Database startup failed after 3 attempts: {exc}")
-                break
-            print(f"[WARN] Database startup error: {exc}")
-            break
+            else:
+                logging.error("Database completely failed to start after 3 attempts.")
 
     if REDIS_URL:
         try:
