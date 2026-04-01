@@ -168,7 +168,7 @@ export default function App() {
                 <GlobalSearch onSelectStudent={setSelectedStudent} variant="table" />
               </div>
               <div className="flex items-center justify-between px-2">
-                <h3 className="text-[16px] font-display font-semibold tracking-tight text-slate-900 dark:text-[#eef1f7]">Xuất dữ liệu</h3>
+                <h3 className="text-[16px] font-display font-semibold tracking-tight text-slate-900 dark:text-[#eef1f7]">Danh sách thí sinh</h3>
               </div>
               <StudentTable
                 data={studentsData}
