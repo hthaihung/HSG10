@@ -15,6 +15,7 @@ from redis.asyncio import Redis
 from sqlalchemy import Float, Integer, String, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.pool import NullPool
 
 PRIZE_LEVELS = ["Nhất", "Nhì", "Ba", "Khuyến khích"]
 CACHE_TTL_SECONDS = 600
@@ -90,9 +91,7 @@ class Student(Base):
 engine = create_async_engine(
     DATABASE_URL,
     future=True,
-    pool_pre_ping=True,
-    pool_size=3,
-    max_overflow=5,
+    poolclass=NullPool,
     connect_args=DB_CONNECT_ARGS,
 )
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
