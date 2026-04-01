@@ -30,8 +30,9 @@ _RAW_DB_URL = os.environ["DATABASE_URL"]
 # lẫn trường hợp đã có prefix driver cũ.
 _DATABASE_URL = (
     _RAW_DB_URL
-    .replace("postgresql+" + "asyn" + "cpg://", "postgresql+psycopg://")
-    .replace("postgresql://", "postgresql+psycopg://")
+    .replace("postgresql+" + "asyn" + "cpg://", "postgresql+psycopg_async://")
+    .replace("postgresql+psycopg://", "postgresql+psycopg_async://")
+    .replace("postgresql://", "postgresql+psycopg_async://")
 )
 REDIS_URL = os.getenv("REDIS_URL")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
@@ -61,21 +62,11 @@ class Student(Base):
 
 engine = create_async_engine(
     _DATABASE_URL,
-    pool_size=2,        # 2 kết nối persistent/instance × 3 instances
-                        # = 6 steady-state. An toàn dưới giới hạn 15
-                        # của Supabase Free Tier.
-    max_overflow=2,     # Burst tối đa: (2+2) × 3 = 12 kết nối.
-                        # Vẫn dưới ngưỡng 15. Tăng từ 1→2 vì psycopg
-                        # xử lý burst tốt hơn qua libpq.
-    pool_recycle=180,   # Tái tạo kết nối sau 3 phút — đủ ngắn để
-                        # SQLAlchemy luôn thắng race với PgBouncer
-                        # Free Tier (kill idle sau ~5 phút).
-    pool_pre_ping=True, # Kiểm tra kết nối trước khi dùng. Với
-                        # psycopg3, pre_ping dùng libpq nên nhanh
-                        # và đáng tin cậy hơn.
-    pool_use_lifo=True, # Tái dùng kết nối mới nhất trước, giữ số
-                        # kết nối "warm" ở mức tối thiểu.
-    pool_timeout=20,    # Chờ tối đa 20s để lấy slot từ pool.
+    pool_size=2,
+    max_overflow=0,
+    pool_timeout=30,
+    pool_recycle=1800,
+    pool_pre_ping=True,
     echo=False,
 )
 
@@ -323,9 +314,8 @@ async def get_stats(
     xep_giai: Optional[str] = Query(None),
 ):
     async with SessionLocal() as session:
-        base = apply_filters(select(Student), mon_thi, truong, gioi_tinh, xep_giai)
-
-        total = int((await session.execute(select(func.count()).select_from(base.subquery()))).scalar_one())
+        total_query = apply_filters(select(func.count()), mon_thi, truong, gioi_tinh, xep_giai)
+        total = int((await session.execute(total_query)).scalar_one())
 
         if total == 0:
             return {
@@ -336,7 +326,8 @@ async def get_stats(
                 "prize_breakdown": {level: 0 for level in PRIZE_LEVELS},
             }
 
-        avg_score = float((await session.execute(select(func.coalesce(func.avg(base.subquery().c.diem), 0.0)))).scalar_one())
+        avg_query = apply_filters(select(func.coalesce(func.avg(Student.diem), 0.0)), mon_thi, truong, gioi_tinh, xep_giai)
+        avg_score = float((await session.execute(avg_query)).scalar_one())
 
         prize_case = case((Student.xep_giai.in_(PRIZE_LEVELS), 1), else_=0)
         prize_total_query = apply_filters(select(func.sum(prize_case)), mon_thi, truong, gioi_tinh, xep_giai)
@@ -464,17 +455,18 @@ async def get_students(
 ):
     async with SessionLocal() as session:
         query = apply_filters(select(Student), mon_thi, truong, gioi_tinh, xep_giai)
+        count_query = apply_filters(select(func.count()), mon_thi, truong, gioi_tinh, xep_giai)
 
         if search and search.strip():
             value = search.strip().lower()
-            query = query.where(
-                or_(
-                    func.lower(Student.sbd).like(f"%{value}%"),
-                    func.lower(Student.ho_ten).like(f"%{value}%"),
-                )
+            search_clause = or_(
+                func.lower(Student.sbd).like(f"%{value}%"),
+                func.lower(Student.ho_ten).like(f"%{value}%"),
             )
+            query = query.where(search_clause)
+            count_query = count_query.where(search_clause)
 
-        total = int((await session.execute(select(func.count()).select_from(query.subquery()))).scalar_one())
+        total = int((await session.execute(count_query)).scalar_one())
 
         if total == 0:
             return {
