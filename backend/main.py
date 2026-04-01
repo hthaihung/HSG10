@@ -175,7 +175,7 @@ def apply_filters(query, mon_thi: Optional[str], truong: Optional[str], gioi_tin
         query = query.where(func.lower(Student.xep_giai).like(f"%{str(xep_giai).lower()}%"))
     return query
 
-
+#hoangthaihung
 async def fetch_filtered_rows(
     session: AsyncSession,
     mon_thi: Optional[str],
