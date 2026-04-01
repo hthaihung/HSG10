@@ -3,7 +3,6 @@ import io
 import json
 import math
 import os
-import asyncio
 import logging
 from functools import wraps
 from typing import Any, Awaitable, Callable, Optional
@@ -13,7 +12,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
-from sqlalchemy import Float, Integer, String, case, func, or_, select, text
+from sqlalchemy import Float, Integer, String, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -279,27 +278,14 @@ async def clear_cache_namespace() -> int:
 @app.on_event("startup")
 async def startup_event():
     global redis_client
-
-    for attempt in range(1, 4):
-        try:
-            async with engine.begin() as conn:
-                await conn.execute(text("SELECT 1"))
-                await conn.run_sync(Base.metadata.create_all)
-            logging.info("Database connected successfully.")
-            break
-        except Exception as e:
-            logging.warning(f"Database startup failed (attempt {attempt}/3). Error: {str(e)}")
-            if attempt < 3:
-                await asyncio.sleep(5)
-            else:
-                logging.error("Database completely failed to start after 3 attempts.")
+    logging.info("🚀 Web server is starting... Database will connect lazily.")
 
     if REDIS_URL:
         try:
             redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
-            await redis_client.ping()
+            logging.info("⚡ Redis client initialized.")
         except Exception as exc:
-            print(f"[WARN] Redis unavailable, caching disabled: {exc}")
+            logging.warning(f"⚠️ Redis unavailable: {exc}")
             redis_client = None
 
 
