@@ -4,9 +4,12 @@ import json
 import math
 import os
 import logging
+import ssl
+import socket
+import random
 from functools import wraps
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, urlparse
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +18,7 @@ from redis.asyncio import Redis
 from sqlalchemy import Float, Integer, String, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.pool import QueuePool
 
 PRIZE_LEVELS = ["Nhất", "Nhì", "Ba", "Khuyến khích"]
 CACHE_TTL_SECONDS = 600
@@ -26,6 +30,10 @@ REDIS_URL = os.getenv("REDIS_URL")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 logging.basicConfig(level=logging.INFO)
 
+_ssl_context = ssl.create_default_context()
+_ssl_context.check_hostname = False
+_ssl_context.verify_mode = ssl.CERT_NONE
+
 
 def normalize_async_database_url(url: str) -> str:
     """Force SQLAlchemy async URL format for Postgres + asyncpg."""
@@ -36,6 +44,20 @@ def normalize_async_database_url(url: str) -> str:
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+asyncpg://", 1)
     return url
+
+
+def _resolve_ipv4(database_url: str) -> str:
+    try:
+        parsed = urlparse(database_url)
+        hostname = parsed.hostname
+        results = socket.getaddrinfo(hostname, None, socket.AF_INET)
+        if not results:
+            return database_url
+        ipv4 = results[0][4][0]
+        resolved = parsed._replace(netloc=f"{parsed.username}:{parsed.password}@{ipv4}:{parsed.port}")
+        return resolved.geturl()
+    except Exception:
+        return database_url
 
 
 def sanitize_db_url_and_connect_args(url: str) -> tuple[str, dict[str, Any]]:
@@ -62,6 +84,7 @@ def sanitize_db_url_and_connect_args(url: str) -> tuple[str, dict[str, Any]]:
 
 DATABASE_URL = normalize_async_database_url(DATABASE_URL_RAW)
 DATABASE_URL, _LEGACY_CONNECT_ARGS_UNUSED = sanitize_db_url_and_connect_args(DATABASE_URL)
+_DATABASE_URL = _resolve_ipv4(DATABASE_URL)
 
 
 class Base(DeclarativeBase):
@@ -93,13 +116,14 @@ class Student(Base):
 # command_timeout=10: thời gian tối đa (giây) asyncpg chờ 1 query hoàn thành.
 # timeout=10: thời gian tối đa (giây) asyncpg chờ thiết lập kết nối mới.
 # Cả hai phải NHỎ HƠN pool_timeout (15s) để tránh collision timeout.
+_POOL_RECYCLE_SECONDS = 180 + random.randint(-30, 30)
+
 _ASYNCPG_CONNECT_ARGS = {
     "statement_cache_size": 0,
     "command_timeout": 10,
-    "timeout": 10,
-    "server_settings": {
-        "application_name": "hsg_fastapi",
-    },
+    "timeout": 12,
+    "ssl": _ssl_context,
+    "server_settings": {"application_name": "hsg_fastapi"},
 }
 
 # --- Lý do chọn từng tham số của QueuePool ---
@@ -138,13 +162,12 @@ _ASYNCPG_CONNECT_ARGS = {
 #   pool_recycle và bị drop sạch sẽ. Giảm đáng kể số lượng kết nối bị
 #   PgBouncer kill ngầm bên dưới.
 engine = create_async_engine(
-    os.environ["DATABASE_URL"],  
-    # DATABASE_URL phải có dạng:
-    # postgresql+asyncpg://user:pass@host:6543/db?prepared_statement_cache_size=0
+    _DATABASE_URL,
+    poolclass=QueuePool,
     pool_size=2,
     max_overflow=1,
-    pool_recycle=180,
-    pool_timeout=15,
+    pool_recycle=_POOL_RECYCLE_SECONDS,
+    pool_timeout=20,
     pool_pre_ping=True,
     pool_use_lifo=True,
     connect_args=_ASYNCPG_CONNECT_ARGS,
