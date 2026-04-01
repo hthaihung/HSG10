@@ -18,7 +18,6 @@ from redis.asyncio import Redis
 from sqlalchemy import Float, Integer, String, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy.pool import QueuePool
 
 PRIZE_LEVELS = ["Nhất", "Nhì", "Ba", "Khuyến khích"]
 CACHE_TTL_SECONDS = 600
@@ -163,7 +162,6 @@ _ASYNCPG_CONNECT_ARGS = {
 #   PgBouncer kill ngầm bên dưới.
 engine = create_async_engine(
     _DATABASE_URL,
-    poolclass=QueuePool,
     pool_size=2,
     max_overflow=1,
     pool_recycle=_POOL_RECYCLE_SECONDS,
