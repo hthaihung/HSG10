@@ -15,7 +15,6 @@ from redis.asyncio import Redis
 from sqlalchemy import Float, Integer, String, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy.pool import QueuePool
 
 PRIZE_LEVELS = ["Nhất", "Nhì", "Ba", "Khuyến khích"]
 CACHE_TTL_SECONDS = 600
@@ -93,7 +92,7 @@ class Student(Base):
 engine = create_async_engine(
     DATABASE_URL,
     future=True,
-    poolclass=QueuePool,
+    # SQLAlchemy async engine uses async-adapted queue pool by default.
     pool_size=2,
     max_overflow=2,
     pool_timeout=10,
