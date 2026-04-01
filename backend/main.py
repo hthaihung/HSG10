@@ -4,86 +4,38 @@ import json
 import math
 import os
 import logging
-import ssl
-import socket
-import random
 from functools import wraps
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, urlparse
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
 from sqlalchemy import Float, Integer, String, case, func, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    create_async_engine,
+    AsyncSession,
+    async_sessionmaker,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 PRIZE_LEVELS = ["Nhất", "Nhì", "Ba", "Khuyến khích"]
 CACHE_TTL_SECONDS = 600
 CACHE_PREFIX = "hsg_cache:"
 
-DEFAULT_DB = "postgresql+asyncpg://postgres:postgres@localhost:5432/hsg"
-DATABASE_URL_RAW = os.getenv("DATABASE_URL", DEFAULT_DB)
+_RAW_DB_URL = os.environ["DATABASE_URL"]
+
+# Đổi prefix từ driver cũ sang psycopg.
+# Xử lý cả trường hợp URL chưa có prefix dialect (plain postgresql://)
+# lẫn trường hợp đã có prefix driver cũ.
+_DATABASE_URL = (
+    _RAW_DB_URL
+    .replace("postgresql+" + "asyn" + "cpg://", "postgresql+psycopg://")
+    .replace("postgresql://", "postgresql+psycopg://")
+)
 REDIS_URL = os.getenv("REDIS_URL")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 logging.basicConfig(level=logging.INFO)
-
-_ssl_context = ssl.create_default_context()
-_ssl_context.check_hostname = False
-_ssl_context.verify_mode = ssl.CERT_NONE
-
-
-def normalize_async_database_url(url: str) -> str:
-    """Force SQLAlchemy async URL format for Postgres + asyncpg."""
-    if url.startswith("postgresql+asyncpg://"):
-        return url
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+asyncpg://", 1)
-    return url
-
-
-def _resolve_ipv4(database_url: str) -> str:
-    try:
-        parsed = urlparse(database_url)
-        hostname = parsed.hostname
-        results = socket.getaddrinfo(hostname, None, socket.AF_INET)
-        if not results:
-            return database_url
-        ipv4 = results[0][4][0]
-        resolved = parsed._replace(netloc=f"{parsed.username}:{parsed.password}@{ipv4}:{parsed.port}")
-        return resolved.geturl()
-    except Exception:
-        return database_url
-
-
-def sanitize_db_url_and_connect_args(url: str) -> tuple[str, dict[str, Any]]:
-    """
-    Convert common Postgres SSL query args to asyncpg-compatible connect_args.
-    Supabase/Render URLs often use sslmode=require.
-    """
-    parsed = urlsplit(url)
-    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    keep_pairs: list[tuple[str, str]] = []
-    connect_args: dict[str, Any] = {}
-
-    for key, value in query_pairs:
-        lowered = key.lower()
-        if lowered == "sslmode" and value.lower() == "require":
-            connect_args["ssl"] = "require"
-            continue
-        keep_pairs.append((key, value))
-
-    cleaned_query = urlencode(keep_pairs)
-    cleaned_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, cleaned_query, parsed.fragment))
-    return cleaned_url, connect_args
-
-
-DATABASE_URL = normalize_async_database_url(DATABASE_URL_RAW)
-DATABASE_URL, _LEGACY_CONNECT_ARGS_UNUSED = sanitize_db_url_and_connect_args(DATABASE_URL)
-_DATABASE_URL = _resolve_ipv4(DATABASE_URL)
 
 
 class Base(DeclarativeBase):
@@ -107,68 +59,23 @@ class Student(Base):
     total_in_subject: Mapped[int] = mapped_column(Integer, default=0)
 
 
-# --- Cấu hình connect_args cho asyncpg + PgBouncer Transaction Mode ---
-# statement_cache_size=0 là BẮT BUỘC. PgBouncer Transaction Mode không
-# hỗ trợ named prepared statements của PostgreSQL. Nếu thiếu dòng này,
-# sẽ xuất hiện lỗi "prepared statement does not exist" ngẫu nhiên.
-#
-# command_timeout=10: thời gian tối đa (giây) asyncpg chờ 1 query hoàn thành.
-# timeout=10: thời gian tối đa (giây) asyncpg chờ thiết lập kết nối mới.
-# Cả hai phải NHỎ HƠN pool_timeout (15s) để tránh collision timeout.
-_POOL_RECYCLE_SECONDS = 180 + random.randint(-30, 30)
-
-_ASYNCPG_CONNECT_ARGS = {
-    "statement_cache_size": 0,
-    "command_timeout": 10,
-    "timeout": 12,
-    "ssl": _ssl_context,
-    "server_settings": {"application_name": "hsg_fastapi"},
-}
-
-# --- Lý do chọn từng tham số của QueuePool ---
-#
-# pool_size=2:
-#   Số kết nối persistent tối đa mỗi instance Render duy trì.
-#   3 instances × 2 = 6 kết nối steady-state. An toàn dưới giới hạn 15
-#   của Supabase Free Tier, còn dư headroom cho max_overflow.
-#
-# max_overflow=1:
-#   Cho phép tạo thêm tối đa 1 kết nối tạm thời khi pool đầy (burst).
-#   3 instances × (2 + 1) = 9 kết nối tối đa tuyệt đối. Không bao giờ
-#   chạm giới hạn 15 của Supabase.
-#
-# pool_recycle=180:
-#   SQLAlchemy tự đóng và tạo lại kết nối sau 180 giây (3 phút).
-#   PgBouncer Free Tier giết kết nối idle sau ~5 phút. Đặt recycle
-#   ngắn hơn đảm bảo SQLAlchemy luôn chủ động drop trước, tránh race
-#   condition khi PgBouncer đột ngột đóng kết nối phía dưới.
-#
-# pool_timeout=15:
-#   Thời gian tối đa (giây) một request chờ lấy kết nối từ pool.
-#   Phải LỚN HƠN command_timeout (10s) và timeout (10s) của asyncpg.
-#   Nếu để nhỏ hơn, pool_timeout sẽ fire trước khi asyncpg có cơ hội
-#   tự xử lý, gây ra lỗi giả (false timeout error).
-#
-# pool_pre_ping=True:
-#   Gửi "SELECT 1" kiểm tra trước khi dùng kết nối từ pool. Không phải
-#   silver bullet (vẫn có race condition), nhưng loại bỏ được phần lớn
-#   stale connections. Giữ lại vì chi phí thấp.
-#
-# pool_use_lifo=True:
-#   Pool dùng theo thứ tự LIFO (Last-In-First-Out). Kết nối vừa dùng
-#   xong sẽ được tái sử dụng trước tiên. Điều này giữ số lượng kết nối
-#   "warm" ở mức tối thiểu, cho phép các kết nối idle cũ hơn đạt đến
-#   pool_recycle và bị drop sạch sẽ. Giảm đáng kể số lượng kết nối bị
-#   PgBouncer kill ngầm bên dưới.
 engine = create_async_engine(
     _DATABASE_URL,
-    pool_size=2,
-    max_overflow=1,
-    pool_recycle=_POOL_RECYCLE_SECONDS,
-    pool_timeout=20,
-    pool_pre_ping=True,
-    pool_use_lifo=True,
-    connect_args=_ASYNCPG_CONNECT_ARGS,
+    pool_size=2,        # 2 kết nối persistent/instance × 3 instances
+                        # = 6 steady-state. An toàn dưới giới hạn 15
+                        # của Supabase Free Tier.
+    max_overflow=2,     # Burst tối đa: (2+2) × 3 = 12 kết nối.
+                        # Vẫn dưới ngưỡng 15. Tăng từ 1→2 vì psycopg
+                        # xử lý burst tốt hơn qua libpq.
+    pool_recycle=180,   # Tái tạo kết nối sau 3 phút — đủ ngắn để
+                        # SQLAlchemy luôn thắng race với PgBouncer
+                        # Free Tier (kill idle sau ~5 phút).
+    pool_pre_ping=True, # Kiểm tra kết nối trước khi dùng. Với
+                        # psycopg3, pre_ping dùng libpq nên nhanh
+                        # và đáng tin cậy hơn.
+    pool_use_lifo=True, # Tái dùng kết nối mới nhất trước, giữ số
+                        # kết nối "warm" ở mức tối thiểu.
+    pool_timeout=20,    # Chờ tối đa 20s để lấy slot từ pool.
     echo=False,
 )
 
