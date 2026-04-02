@@ -1,123 +1,113 @@
+﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import sys
-from pathlib import Path
-
 import pandas as pd
-import redis
-import requests
 from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-REDIS_URL = os.getenv("REDIS_URL")
-RENDER_API_URL = os.getenv("RENDER_API_URL", "").strip()
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+# 1. TẢI BIẾN MÔI TRƯỜNG TỪ FILE .ENV (Bảo mật, không hardcode password)
+load_dotenv()
+DB_URL = os.getenv("DATABASE_URL")
 
-if not DATABASE_URL:
-    print("LOI: Chua co DATABASE_URL.")
+if not DB_URL:
+    print("❌ LỖI: Chưa có biến DATABASE_URL trong file .env")
     sys.exit(1)
 
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Ép dùng driver đồng bộ `psycopg` (vì script này chạy tuần tự, không cần async)
+DB_URL = DB_URL.replace("postgresql+asyncpg://", "postgresql+psycopg://")
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql+psycopg://")
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-EXCEL_PATH = BASE_DIR / "data" / "Tong_hop.xlsx"
+# 2. CẤU HÌNH THÔNG SỐ
+FILE_PATH = "output/Tong_hop.xlsx"  # File tổng hợp mà tool cào sinh ra
+TABLE_NAME = "students"             # Tên bảng trong Database của sếp
 
+# Mapping: Cột Excel (Tiếng Việt) -> Cột Database (Sếp tự chỉnh lại vế phải cho đúng DB nhé)
+COLUMN_MAPPING = {
+    "SBD": "sbd",
+    "Họ và tên": "ho_ten",
+    "Ngày sinh": "ngay_sinh",
+    "Giới tính": "gioi_tinh",
+    "Lớp": "lop",
+    "Trường": "truong",
+    "Môn thi": "mon_thi",
+    "Điểm": "diem",
+    "Xếp giải": "xep_giai"
+}
 
-def clear_remote_cache():
-    if not RENDER_API_URL or not ADMIN_API_KEY:
-        return
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Hàm chuẩn hóa và làm sạch dữ liệu trước khi đẩy lên DB"""
+    # 0. Chuẩn hóa header Excel: xóa khoảng trắng thừa
+    df.columns = df.columns.str.strip()
 
-    endpoint = f"{RENDER_API_URL.rstrip('/')}/api/admin/clear-cache"
-    try:
-        response = requests.post(
-            endpoint,
-            headers={"X-Admin-Key": ADMIN_API_KEY},
-            timeout=10,
-        )
-        response.raise_for_status()
-        print("Da goi API xoa cache tren Render.")
-    except Exception as exc:
-        print(f"Canh bao: goi API xoa cache that bai: {exc}")
+    # 1. Đổi tên cột chuẩn xác
+    df = df.rename(columns=COLUMN_MAPPING)
+    
+    # 2. Lọc bỏ các cột thừa (chỉ giữ lại những cột có trong DB)
+    db_cols = list(COLUMN_MAPPING.values())
+    df = df[[col for col in db_cols if col in df.columns]]
+    
+    # 3. Chuẩn hóa cột Điểm (đổi dấu phẩy thành dấu chấm, ép kiểu số thực)
+    if "diem" in df.columns:
+        df["diem"] = df["diem"].astype(str).str.replace(",", ".").str.replace(" ", "")
+        df["diem"] = pd.to_numeric(df["diem"], errors="coerce") # Lỗi tự thành NaN
+        
+    # 4. Biến NaN/rỗng thành None/NULL để PostgreSQL lưu đúng kiểu dữ liệu
+    df = df.replace({float("nan"): None, "": None})
+    df = df.where(pd.notnull(df), None)
+    
+    return df
 
+def main():
+    print(f"🚀 Bắt đầu tiến trình ETL dữ liệu từ {FILE_PATH}...")
 
-def clear_redis_direct():
-    if not REDIS_URL:
-        return
-
-    try:
-        client = redis.from_url(REDIS_URL)
-        client.flushdb()
-        print("Da don dep cache Redis truc tiep.")
-    except Exception as exc:
-        print(f"Canh bao: don Redis truc tiep that bai: {exc}")
-
-
-def process_and_upload():
-    print("Bat dau doc du lieu tu Excel...")
-
-    if not EXCEL_PATH.exists():
-        print(f"LOI: Khong tim thay file tai {EXCEL_PATH}")
+    if not os.path.exists(FILE_PATH):
+        print(f"❌ LỖI: Không tìm thấy file {FILE_PATH}. Sếp chạy tool cào điểm trước nhé!")
         sys.exit(1)
 
-    raw = pd.read_excel(EXCEL_PATH, engine="openpyxl", header=None)
-    header_idx = -1
-    for idx, row in raw.iterrows():
-        row_text = " ".join(row.astype(str).str.lower())
-        if "sbd" in row_text and "họ" in row_text and "tên" in row_text:
-            header_idx = idx
-            break
+    # BƯỚC 1: ĐỌC DỮ LIỆU
+    print("📖 Đang đọc file Excel...")
+    df = pd.read_excel(FILE_PATH)
+    print(f"✅ Đã tải {len(df):,} dòng dữ liệu vào RAM.")
 
-    if header_idx == -1:
-        print("LOI: Khong tim thay dong tieu de.")
-        sys.exit(1)
+    # BƯỚC 2: CLEAN DATA
+    print("🧹 Đang dọn dẹp và chuẩn hóa dữ liệu...")
+    df = clean_data(df)
 
-    raw.columns = raw.iloc[header_idx].astype(str).str.replace("\n", " ").str.strip().str.lower()
-    raw = raw.iloc[header_idx + 1 :].reset_index(drop=True)
+    # BƯỚC 3: KẾT NỐI DB VÀ UPLOAD
+    print("🔌 Đang khởi tạo kết nối tới Supabase...")
+    engine = create_engine(DB_URL, pool_pre_ping=True, echo=False)
 
-    dataset = pd.DataFrame(
-        {
-            "sbd": raw.get("sbd", pd.Series(dtype=str)).astype(str),
-            "ho_ten": raw.get("họ và tên", pd.Series(dtype=str)).astype(str),
-            "ngay_sinh": raw.get("ngày sinh", pd.Series(dtype=str)).astype(str),
-            "truong": raw.get("trường", pd.Series(dtype=str)).astype(str),
-            "mon_thi": raw.get("môn thi", pd.Series(dtype=str)).astype(str),
-            "diem": raw.get("điểm", pd.Series(dtype=str)),
-            "xep_giai": raw.get("xếp giải", pd.Series(dtype=str)).astype(str),
-            "gioi_tinh": raw.get("giới tính", pd.Series(dtype=str)).astype(str),
-        }
-    )
-
-    dataset["sbd"] = dataset["sbd"].str.strip()
-    dataset = dataset[~dataset["sbd"].isin(["", "nan", "None", "NaN"])]
-    dataset = dataset[~dataset["sbd"].astype(str).str.lower().str.contains("sbd", na=False)]
-
-    dataset["diem"] = dataset["diem"].astype(str).str.replace(",", ".", regex=False).str.strip()
-    dataset["diem"] = pd.to_numeric(dataset["diem"], errors="coerce").fillna(0.0)
-    dataset["xep_giai"] = dataset["xep_giai"].str.replace(r"(?i)^giải\s+", "", regex=True).str.strip()
-
-    for col in ["ho_ten", "ngay_sinh", "truong", "mon_thi", "gioi_tinh", "xep_giai"]:
-        dataset.loc[dataset[col].str.lower() == "nan", col] = ""
-
-    dataset["percentile"] = dataset.groupby("mon_thi")["diem"].rank(pct=True, ascending=False).fillna(0.0)
-    dataset["rank"] = dataset.groupby("mon_thi")["diem"].rank(method="min", ascending=False).fillna(0).astype(int)
-    dataset["total_in_subject"] = dataset.groupby("mon_thi")["diem"].transform("count").fillna(0).astype(int)
-
-    print(f"Dang day {len(dataset)} hoc sinh len database...")
-    engine = create_engine(DATABASE_URL)
-    with engine.begin() as connection:
-        dataset.to_sql("students", con=connection, index=False, if_exists="replace")
-
-        print("Dang tao lai khoa chinh cho bang students...")
-        connection.execute(text("ALTER TABLE students ADD COLUMN id SERIAL PRIMARY KEY;"))
-        connection.execute(text("CREATE INDEX IF NOT EXISTS idx_students_sbd ON students (sbd)"))
-        connection.execute(text("CREATE INDEX IF NOT EXISTS idx_students_ho_ten ON students (ho_ten)"))
-        connection.execute(text("CREATE INDEX IF NOT EXISTS idx_students_truong ON students (truong)"))
-        connection.execute(text("CREATE INDEX IF NOT EXISTS idx_students_mon_thi ON students (mon_thi)"))
-
-    print("Day du lieu len database thanh cong.")
-    clear_remote_cache()
-    clear_redis_direct()
-
+    try:
+        with engine.begin() as conn:  # Tự động Transaction: Thành công thì Commit, lỗi thì Rollback toàn bộ
+            
+            # --- TÙY CHỌN 1: XÓA SẠCH DATA CŨ TRƯỚC KHI NẠP MỚI ---
+            # (NẾU SẾP MUỐN XÓA DATA CŨ CỦA HSG 11 ĐỂ THAY BẰNG HSG 10 THÌ BỎ COMMENT 2 DÒNG DƯỚI)
+            print(f"🗑️ Đang xóa dữ liệu cũ trong bảng '{TABLE_NAME}'...")
+            conn.execute(text(f"TRUNCATE TABLE {TABLE_NAME} RESTART IDENTITY;"))
+            
+            print(f"⏳ Đang Bơm dữ liệu lên bảng '{TABLE_NAME}' (Batch Insert)...")
+            
+            # method='multi': Gộp nhiều lệnh INSERT thành 1 câu SQL khổng lồ
+            # chunksize=500: Cứ 500 dòng đẩy 1 lần, không làm tràn RAM hay timeout DB
+            df.to_sql(
+                name=TABLE_NAME,
+                con=conn,
+                if_exists="append", 
+                index=False,
+                method="multi",
+                chunksize=500
+            )
+            
+            print(f"🎉 THÀNH CÔNG RỰC RỠ! Đã lưu an toàn {len(df):,} học sinh vào Database.")
+            
+    except Exception as e:
+        print(f"❌ LỖI RỒI SẾP ƠI (Transaction đã được Rollback):\n{e}")
+    finally:
+        engine.dispose()
+        print("🔒 Đã đóng kết nối Database an toàn.")
 
 if __name__ == "__main__":
-    process_and_upload()
+    main()
